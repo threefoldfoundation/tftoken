@@ -273,6 +273,38 @@ func (w *stellarWallet) submitTransaction(ctx context.Context, txn txnbuild.Tran
 	return nil
 }
 
+func (w *stellarWallet) refundTransaction(ctx context.Context, totalAmount uint64, tx hProtocol.Transaction) {
+	ops, err := w.getOperationEffect(tx.Hash)
+	if err != nil {
+		return
+	}
+	for _, op := range ops.Embedded.Records {
+		if op.GetType() == "payment" {
+			paymentOperation := op.(operations.Payment)
+
+			if paymentOperation.To == w.keypair.Address() {
+				amount := totalAmount - uint64(WithdrawFee)
+				if amount == 0 {
+					return
+				}
+				log.Warn("Calling refund")
+
+				err := w.CreateAndSubmitRefund(ctx, paymentOperation.From, amount, tx.Hash, true)
+				for err != nil {
+					log.Error("error while trying to refund user", "err", err.Error(), "amount", amount)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(10 * time.Second):
+						err = w.CreateAndSubmitRefund(ctx, paymentOperation.From, amount, tx.Hash, true)
+					}
+				}
+			}
+		}
+	}
+
+}
+
 // mint handler
 type mint func(ERC20Address, *big.Int, string) error
 
@@ -286,18 +318,6 @@ func (w *stellarWallet) MonitorBridgeAccountAndMint(ctx context.Context, mintFn 
 		}
 		log.Info("Received transaction on bridge stellar account", "hash", tx.Hash)
 
-		data, err := base64.StdEncoding.DecodeString(tx.Memo)
-		if err != nil {
-			log.Error("error decoding transaction memo", "error", err.Error())
-			return
-		}
-
-		if len(data) != 20 {
-			return
-		}
-		var ethAddress ERC20Address
-		copy(ethAddress[0:20], data)
-
 		effects, err := w.getTransactionEffects(tx.Hash)
 		if err != nil {
 			log.Error("error while fetching transaction effects:", err.Error())
@@ -306,6 +326,7 @@ func (w *stellarWallet) MonitorBridgeAccountAndMint(ctx context.Context, mintFn 
 
 		asset := w.GetAssetCodeAndIssuer()
 
+		var totalAmount int64
 		for _, effect := range effects.Embedded.Records {
 			if effect.GetAccount() != w.keypair.Address() {
 				continue
@@ -320,67 +341,81 @@ func (w *stellarWallet) MonitorBridgeAccountAndMint(ctx context.Context, mintFn 
 					continue
 				}
 
-				depositedAmount := big.NewInt(int64(parsedAmount))
+				totalAmount += parsedAmount
+			}
+		}
 
+		if totalAmount == 0 {
+			return
+		}
+		log.Info("deposited amount", "a", totalAmount)
+		depositedAmount := big.NewInt(totalAmount)
+
+		data, err := base64.StdEncoding.DecodeString(tx.Memo)
+		if err != nil {
+			log.Error("error decoding transaction memo, calling refund", "error", err.Error())
+			w.refundTransaction(ctx, uint64(totalAmount), tx)
+			return
+		}
+
+		// if the user sent an invalid memo, return the funds
+		if len(data) != 20 {
+			log.Error("length of parsed memo is less than 20, caling refund")
+			w.refundTransaction(ctx, uint64(totalAmount), tx)
+			return
+		}
+
+		var ethAddress ERC20Address
+		copy(ethAddress[0:20], data)
+
+		err = mintFn(ethAddress, depositedAmount, tx.Hash)
+		for err != nil {
+			log.Error(fmt.Sprintf("Error occured while minting: %s", err.Error()))
+			if err == errInsufficientDepositAmount {
+				log.Warn("User is trying to swap less than the fee amount, refunding now", "amount", totalAmount)
+				w.refundTransaction(ctx, uint64(totalAmount), tx)
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(10 * time.Second):
 				err = mintFn(ethAddress, depositedAmount, tx.Hash)
-				for err != nil {
-					log.Error(fmt.Sprintf("Error occured while minting: %s", err.Error()))
-					if err == errInsufficientDepositAmount {
-						log.Warn("User is trying to swap less than the fee amount, refunding now", "amount", parsedAmount)
-						ops, err := w.getOperationEffect(tx.Hash)
-						if err != nil {
-							continue
-						}
-						for _, op := range ops.Embedded.Records {
-							if op.GetType() == "payment" {
-								paymentOpation := op.(operations.Payment)
+			}
+		}
 
-								if paymentOpation.To == w.keypair.Address() {
-									log.Warn("Calling refund")
-									err := w.CreateAndSubmitRefund(context.Background(), paymentOpation.From, uint64(parsedAmount), tx.Hash, true)
-									if err != nil {
-										log.Error("error while trying to refund user", "err", err.Error())
-									}
-								}
-							}
-						}
-						return
-					}
+		if w.config.StellarFeeWallet != "" {
+			log.Info("Trying to transfer the fees generated to the fee wallet", "address", w.config.StellarFeeWallet)
 
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(10 * time.Second):
-						err = mintFn(ethAddress, depositedAmount, tx.Hash)
-					}
-				}
-				if w.config.StellarFeeWallet != "" {
-					log.Info("Trying to transfer the fees generated to the fee wallet", "address", w.config.StellarFeeWallet)
+			// convert tx hash string to bytes
+			parsedMessage, err := hex.DecodeString(tx.Hash)
+			if err != nil {
+				return
+			}
+			var memo [32]byte
+			copy(memo[:], parsedMessage)
 
-					// convert tx hash string to bytes
-					parsedMessage, err := hex.DecodeString(tx.Hash)
-					if err != nil {
-						return
-					}
-					var memo [32]byte
-					copy(memo[:], parsedMessage)
-
-					err = w.CreateAndSubmitFeepayment(context.Background(), DepositFee, memo)
-					if err != nil {
-						log.Error("error while to send fees to the fee wallet", "err", err.Error())
-					}
-				}
-
-				log.Info("Mint succesfull, saving cursor now")
-
-				// save cursor
-				cursor := tx.PagingToken()
-				err = persistency.saveStellarCursor(cursor)
-				if err != nil {
-					log.Error("error while saving cursor:", err.Error())
+			err = w.CreateAndSubmitFeepayment(context.Background(), DepositFee, memo)
+			for err != nil {
+				log.Error("error while to send fees to the fee wallet", "err", err.Error())
+				select {
+				case <-ctx.Done():
 					return
+				case <-time.After(10 * time.Second):
+					err = w.CreateAndSubmitFeepayment(context.Background(), DepositFee, memo)
 				}
 			}
+		}
+
+		log.Info("Mint succesfull, saving cursor now")
+
+		// save cursor
+		cursor := tx.PagingToken()
+		err = persistency.saveStellarCursor(cursor)
+		if err != nil {
+			log.Error("error while saving cursor:", err.Error())
+			return
 		}
 
 	}

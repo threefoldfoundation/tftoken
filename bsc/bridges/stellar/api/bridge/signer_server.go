@@ -219,10 +219,6 @@ func (s *SignerService) validateRefundTransaction(request SignRequest, txn *txnb
 				if effect.GetAccount() != destinationAccount.Address() {
 					return fmt.Errorf("destination is not correct, got %s, need user wallet %s", destinationAccount.Address(), effect.GetAccount())
 				}
-
-				if paymentOperation.Amount > DepositFee {
-					return fmt.Errorf("amount is not correct, we expected a refund transaction with an amount less than %f but we received %d", DepositFee, paymentOperation.Amount)
-				}
 			}
 		}
 
